@@ -39,7 +39,7 @@ function writeHeader(outPath, data) {
             console.error(`Invalid glyph data at index ${i}`, bytes);
             bytes = [0, 0, 0, 0, 0, 0, 0, 0];
         } else {
-            console.log(bytes);
+            // console.log(bytes);
         }
 
         const hex = bytes.map((b) => `0x${b.toString(16).padStart(2, '0')}`).join(', ');
