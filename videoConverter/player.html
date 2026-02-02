@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>RVV Player</title>
+        <style>
+            body {
+                background: #000;
+                color: #0f0;
+                font-family: monospace;
+            }
+            canvas {
+                image-rendering: pixelated;
+                border: 1px solid #444;
+                display: block;
+                margin-top: 10px;
+            }
+        </style>
+    </head>
+    <body>
+        <h3>RVV Player</h3>
+
+        <input type="file" id="file" accept=".rvv" />
+        <div id="info"></div>
+        <canvas id="screen"></canvas>
+
+        <script>
+            const fileInput = document.getElementById('file');
+            const canvas = document.getElementById('screen');
+            const ctx = canvas.getContext('2d');
+            const info = document.getElementById('info');
+
+            let timer = null;
+
+            function u16(buf, off) {
+                return buf[off] | (buf[off + 1] << 8);
+            }
+
+            fileInput.addEventListener('change', async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                if (timer) {
+                    clearInterval(timer);
+                    timer = null;
+                }
+
+                const buffer = await file.arrayBuffer();
+                const data = new Uint8Array(buffer);
+                let off = 0;
+
+                // ---------------------------------------------------------------------
+                // Header (RVV2)
+                // ---------------------------------------------------------------------
+
+                const magic = String.fromCharCode(...data.slice(0, 4));
+                if (magic !== 'RVV2') {
+                    alert('Unsupported format (expected RVV2)');
+                    return;
+                }
+
+                const width = u16(data, 4);
+                const height = u16(data, 6);
+                const tileW = data[8];
+                const tileH = data[9];
+                const bpp = data[10];
+                const fps = data[11];
+                const frames = u16(data, 12);
+                const paletteSize = u16(data, 14);
+
+                off = 16;
+
+                info.textContent = `${file.name} | ${width}x${height} | ${bpp}bpp | ${fps}fps | ${frames} frames | palette ${paletteSize}`;
+
+                // ---------------------------------------------------------------------
+                // Palette (RGB888)
+                // ---------------------------------------------------------------------
+
+                const palette = new Array(paletteSize);
+                for (let i = 0; i < paletteSize; i++) {
+                    const r = data[off++];
+                    const g = data[off++];
+                    const b = data[off++];
+                    palette[i] = { r, g, b };
+                }
+
+                // ---------------------------------------------------------------------
+                // Geometry
+                // ---------------------------------------------------------------------
+
+                const tilesX = width / tileW;
+                const tilesY = height / tileH;
+                const tileCount = tilesX * tilesY;
+                const bytesPerTile = (tileW * tileH * bpp) >> 3;
+
+                // ---------------------------------------------------------------------
+                // Canvas / framebuffer
+                // ---------------------------------------------------------------------
+
+                canvas.width = width;
+                canvas.height = height;
+
+                const img = ctx.createImageData(width, height);
+
+                // framebuffer хранит ИНДЕКСЫ палитры
+                const fb = new Uint8Array(width * height);
+
+                // ---------------------------------------------------------------------
+                // Tile unpack
+                // ---------------------------------------------------------------------
+
+                function unpackTile(tileData, tileIndex) {
+                    const tx = tileIndex % tilesX;
+                    const ty = (tileIndex / tilesX) | 0;
+
+                    let bit = 0;
+                    let byte = 0;
+
+                    for (let y = 0; y < tileH; y++) {
+                        for (let x = 0; x < tileW; x++) {
+                            let v = 0;
+                            for (let b = 0; b < bpp; b++) {
+                                v = (v << 1) | ((tileData[byte] >> (7 - bit)) & 1);
+                                bit++;
+                                if (bit === 8) {
+                                    bit = 0;
+                                    byte++;
+                                }
+                            }
+
+                            const px = (ty * tileH + y) * width + (tx * tileW + x);
+
+                            fb[px] = v;
+                        }
+                    }
+                }
+
+                // ---------------------------------------------------------------------
+                // Render (через палитру)
+                // ---------------------------------------------------------------------
+
+                function render() {
+                    for (let i = 0; i < fb.length; i++) {
+                        const c = palette[fb[i]];
+                        const o = i * 4;
+                        img.data[o + 0] = c.r;
+                        img.data[o + 1] = c.g;
+                        img.data[o + 2] = c.b;
+                        img.data[o + 3] = 255;
+                    }
+                    ctx.putImageData(img, 0, 0);
+                }
+
+                // ---------------------------------------------------------------------
+                // Playback loop
+                // ---------------------------------------------------------------------
+
+                let frame = 0;
+
+                timer = setInterval(() => {
+                    if (frame >= frames) {
+                        clearInterval(timer);
+                        return;
+                    }
+
+                    const changed = u16(data, off);
+                    off += 2;
+
+                    for (let i = 0; i < changed; i++) {
+                        const idx = u16(data, off);
+                        off += 2;
+
+                        const tile = data.subarray(off, off + bytesPerTile);
+                        off += bytesPerTile;
+
+                        unpackTile(tile, idx);
+                    }
+
+                    render();
+                    frame++;
+                }, 1000 / fps);
+            });
+        </script>
+    </body>
+</html>
