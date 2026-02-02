@@ -49,13 +49,19 @@
                 const data = new Uint8Array(buffer);
                 let off = 0;
 
-                // ---------------------------------------------------------------------
-                // Header (RVV2)
-                // ---------------------------------------------------------------------
+                // -----------------------------------------------------------------
+                // Header (RVV)
+                // -----------------------------------------------------------------
 
-                const magic = String.fromCharCode(...data.slice(0, 4));
-                if (magic !== 'RVV2') {
-                    alert('Unsupported format (expected RVV2)');
+                const magic = String.fromCharCode(data[0], data[1], data[2]);
+                if (magic !== 'RVV') {
+                    alert('Not an RVV file');
+                    return;
+                }
+
+                const version = data[3];
+                if (version < 5) {
+                    alert(`RVV version ${version} not supported (need v5+)`);
                     return;
                 }
 
@@ -67,35 +73,41 @@
                 const fps = data[11];
                 const frames = u16(data, 12);
                 const paletteSize = u16(data, 14);
+                const keyframeInterval = u16(data, 16);
 
-                off = 16;
+                off = 18;
 
-                info.textContent = `${file.name} | ${width}x${height} | ${bpp}bpp | ${fps}fps | ${frames} frames | palette ${paletteSize}`;
+                info.textContent =
+                    `${file.name} | RVV v${version} | ` +
+                    `${width}x${height} | ${bpp}bpp | ${fps}fps | ` +
+                    `${frames} frames | PAL ${paletteSize} | ` +
+                    `KF ${keyframeInterval || 'first only'}`;
 
-                // ---------------------------------------------------------------------
-                // Palette (RGB888)
-                // ---------------------------------------------------------------------
+                // -----------------------------------------------------------------
+                // Palette
+                // -----------------------------------------------------------------
 
                 const palette = new Array(paletteSize);
                 for (let i = 0; i < paletteSize; i++) {
-                    const r = data[off++];
-                    const g = data[off++];
-                    const b = data[off++];
-                    palette[i] = { r, g, b };
+                    palette[i] = {
+                        r: data[off++],
+                        g: data[off++],
+                        b: data[off++],
+                    };
                 }
 
-                // ---------------------------------------------------------------------
+                // -----------------------------------------------------------------
                 // Geometry
-                // ---------------------------------------------------------------------
+                // -----------------------------------------------------------------
 
                 const tilesX = width / tileW;
                 const tilesY = height / tileH;
                 const tileCount = tilesX * tilesY;
                 const bytesPerTile = (tileW * tileH * bpp) >> 3;
 
-                // ---------------------------------------------------------------------
+                // -----------------------------------------------------------------
                 // Canvas / framebuffer
-                // ---------------------------------------------------------------------
+                // -----------------------------------------------------------------
 
                 canvas.width = width;
                 canvas.height = height;
@@ -104,10 +116,11 @@
 
                 // framebuffer хранит ИНДЕКСЫ палитры
                 const fb = new Uint8Array(width * height);
+                fb.fill(0);
 
-                // ---------------------------------------------------------------------
+                // -----------------------------------------------------------------
                 // Tile unpack
-                // ---------------------------------------------------------------------
+                // -----------------------------------------------------------------
 
                 function unpackTile(tileData, tileIndex) {
                     const tx = tileIndex % tilesX;
@@ -135,9 +148,9 @@
                     }
                 }
 
-                // ---------------------------------------------------------------------
-                // Render (через палитру)
-                // ---------------------------------------------------------------------
+                // -----------------------------------------------------------------
+                // Render
+                // -----------------------------------------------------------------
 
                 function render() {
                     for (let i = 0; i < fb.length; i++) {
@@ -151,9 +164,9 @@
                     ctx.putImageData(img, 0, 0);
                 }
 
-                // ---------------------------------------------------------------------
-                // Playback loop
-                // ---------------------------------------------------------------------
+                // -----------------------------------------------------------------
+                // Playback loop (Skip-index RLE)
+                // -----------------------------------------------------------------
 
                 let frame = 0;
 
@@ -163,17 +176,36 @@
                         return;
                     }
 
-                    const changed = u16(data, off);
+                    /*
+        FrameHeader v5
+        ----------------
+        uint8   flags   (bit0 = keyframe)
+        uint16  update_count
+        */
+
+                    const flags = data[off++];
+                    const isKeyframe = (flags & 1) !== 0;
+                    const updateCount = u16(data, off);
                     off += 2;
 
-                    for (let i = 0; i < changed; i++) {
-                        const idx = u16(data, off);
-                        off += 2;
+                    // current tile cursor
+                    let tileIndex = 0;
 
+                    for (let i = 0; i < updateCount; i++) {
+                        let skip;
+
+                        // skip chaining
+                        do {
+                            skip = data[off++];
+                            tileIndex += skip;
+                        } while (skip === 255);
+
+                        // tile data follows
                         const tile = data.subarray(off, off + bytesPerTile);
                         off += bytesPerTile;
 
-                        unpackTile(tile, idx);
+                        unpackTile(tile, tileIndex);
+                        tileIndex++;
                     }
 
                     render();

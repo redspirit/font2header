@@ -12,23 +12,17 @@ const TILE = 8;
 // -----------------------------------------------------------------------------
 
 const argv = yargs(hideBin(process.argv))
-    .usage('node gif2rvv.js <input.gif> -o out.rvv --bpp <1|2|4|8> --fps <fps>')
+    .usage(
+        'node gif2rvv.js <input.gif> -o out.rvv ' + '--bpp <1|2|4|8> --fps <fps> --kf <interval>'
+    )
     .demandCommand(1)
-    .option('o', {
-        alias: 'output',
-        type: 'string',
-        demandOption: true,
-        describe: 'Output RVV file',
-    })
-    .option('bpp', {
+    .option('o', { alias: 'output', demandOption: true })
+    .option('bpp', { type: 'number', demandOption: true })
+    .option('fps', { type: 'number', demandOption: true })
+    .option('kf', {
         type: 'number',
-        demandOption: true,
-        describe: 'Bits per pixel (1,2,4,8)',
-    })
-    .option('fps', {
-        type: 'number',
-        demandOption: true,
-        describe: 'Frames per second',
+        default: 0,
+        describe: 'Keyframe interval (0 = only first)',
     })
     .help().argv;
 
@@ -36,9 +30,10 @@ const INPUT = argv._[0];
 const OUTPUT = argv.output;
 const BPP = argv.bpp;
 const FPS = argv.fps;
+const KEYFRAME_INTERVAL = argv.kf | 0;
 
 if (![1, 2, 4, 8].includes(BPP)) {
-    throw new Error('bpp must be 1, 2, 4 or 8');
+    throw new Error('Invalid bpp');
 }
 
 // -----------------------------------------------------------------------------
@@ -52,17 +47,14 @@ const WIDTH = gif.lsd.width;
 const HEIGHT = gif.lsd.height;
 
 if (WIDTH % TILE || HEIGHT % TILE) {
-    throw new Error('GIF width/height must be divisible by 8');
+    throw new Error('Width/height must be divisible by 8');
 }
 
 const gct = gif.gct;
-if (!gct) {
-    throw new Error('GIF has no global color table');
-}
-
 const PALETTE_SIZE = 1 << BPP;
-if (gct.length < PALETTE_SIZE) {
-    throw new Error(`GIF palette too small for ${BPP} bpp`);
+
+if (!gct || gct.length < PALETTE_SIZE) {
+    throw new Error('Palette too small');
 }
 
 // -----------------------------------------------------------------------------
@@ -74,30 +66,63 @@ const TILES_Y = HEIGHT / TILE;
 const TILE_COUNT = TILES_X * TILES_Y;
 const BYTES_PER_TILE = (TILE * TILE * BPP) >> 3;
 
-console.log(`GIF: ${WIDTH}x${HEIGHT}, frames=${frames.length}`);
-console.log(`RVV2: ${BPP}bpp, ${FPS}fps`);
-console.log(`Palette used: ${PALETTE_SIZE} colors (from ${gct.length})`);
+console.log(`GIF ${WIDTH}x${HEIGHT}, frames=${frames.length}`);
+console.log(`RVV v5 | ${BPP}bpp | ${FPS}fps | KF=${KEYFRAME_INTERVAL || 'first only'}`);
 
 // -----------------------------------------------------------------------------
-// Open output + write header (RVV2)
+// Write header (RVV v5)
 // -----------------------------------------------------------------------------
 
 const out = fs.openSync(OUTPUT, 'w');
 
-// --- Header (RVV2) ---
-const header = Buffer.alloc(16);
-header.write('RVV2', 0); // magic
-header.writeUInt16LE(WIDTH, 4);
-header.writeUInt16LE(HEIGHT, 6);
-header.writeUInt8(8, 8); // tile_w
-header.writeUInt8(8, 9); // tile_h
-header.writeUInt8(BPP, 10);
-header.writeUInt8(FPS, 11);
-header.writeUInt16LE(frames.length, 12); // frame_count
-header.writeUInt16LE(PALETTE_SIZE, 14); // palette_size
+/*
+RVV v5 HEADER
+--------------------------------
+char[3]  "RVV"
+uint8    version = 5
+uint16   width
+uint16   height
+uint8    tile_w
+uint8    tile_h
+uint8    bpp
+uint8    fps
+uint16   frame_count
+uint16   palette_size
+uint16   keyframe_interval
+*/
+
+const header = Buffer.alloc(18);
+let ho = 0;
+
+header.write('RVV', ho);
+ho += 3;
+header.writeUInt8(5, ho);
+ho += 1;
+header.writeUInt16LE(WIDTH, ho);
+ho += 2;
+header.writeUInt16LE(HEIGHT, ho);
+ho += 2;
+header.writeUInt8(TILE, ho);
+ho += 1;
+header.writeUInt8(TILE, ho);
+ho += 1;
+header.writeUInt8(BPP, ho);
+ho += 1;
+header.writeUInt8(FPS, ho);
+ho += 1;
+header.writeUInt16LE(frames.length, ho);
+ho += 2;
+header.writeUInt16LE(PALETTE_SIZE, ho);
+ho += 2;
+header.writeUInt16LE(KEYFRAME_INTERVAL, ho);
+ho += 2;
+
 fs.writeSync(out, header);
 
-// --- Palette (RGB888) ---
+// -----------------------------------------------------------------------------
+// Palette (RGB888)
+// -----------------------------------------------------------------------------
+
 for (let i = 0; i < PALETTE_SIZE; i++) {
     const [r, g, b] = gct[i];
     fs.writeSync(out, Buffer.from([r, g, b]));
@@ -108,13 +133,13 @@ for (let i = 0; i < PALETTE_SIZE; i++) {
 // -----------------------------------------------------------------------------
 
 function packTile(pixels) {
-    const out = Buffer.alloc(BYTES_PER_TILE);
+    const buf = Buffer.alloc(BYTES_PER_TILE);
     let bit = 0;
     let byte = 0;
 
     for (let p of pixels) {
         for (let b = BPP - 1; b >= 0; b--) {
-            out[byte] |= ((p >> b) & 1) << (7 - bit);
+            buf[byte] |= ((p >> b) & 1) << (7 - bit);
             bit++;
             if (bit === 8) {
                 bit = 0;
@@ -122,10 +147,10 @@ function packTile(pixels) {
             }
         }
     }
-    return out;
+    return buf;
 }
 
-function extractTiles(framebuffer) {
+function extractTiles(fb) {
     const tiles = new Array(TILE_COUNT);
     let ti = 0;
 
@@ -134,8 +159,7 @@ function extractTiles(framebuffer) {
             const pixels = [];
             for (let y = 0; y < TILE; y++) {
                 for (let x = 0; x < TILE; x++) {
-                    const px = (ty * TILE + y) * WIDTH + (tx * TILE + x);
-                    pixels.push(framebuffer[px]);
+                    pixels.push(fb[(ty * TILE + y) * WIDTH + (tx * TILE + x)]);
                 }
             }
             tiles[ti++] = packTile(pixels);
@@ -145,18 +169,16 @@ function extractTiles(framebuffer) {
 }
 
 // -----------------------------------------------------------------------------
-// GIF framebuffer compositing
+// GIF framebuffer
 // -----------------------------------------------------------------------------
 
 const gifFB = new Uint8Array(WIDTH * HEIGHT);
-gifFB.fill(0); // индекс 0 = фон (как в GIF)
+gifFB.fill(0);
 
 let prevTiles = null;
 let prevFrame = null;
 
 function applyDisposal(frame) {
-    // 0 / 1 - do nothing
-    // 2     - restore to background
     if (frame.disposalType === 2) {
         gifFB.fill(0);
     }
@@ -169,65 +191,85 @@ function blitFrame(frame) {
 
     for (let y = 0; y < height; y++) {
         for (let x = 0; x < width; x++) {
-            const srcIdx = y * width + x;
-            const pix = src[srcIdx];
-
-            if (transparent !== undefined && pix === transparent) {
-                continue;
-            }
-
-            const dst = (top + y) * WIDTH + (left + x);
-
-            gifFB[dst] = pix;
+            const i = y * width + x;
+            const pix = src[i];
+            if (transparent !== undefined && pix === transparent) continue;
+            gifFB[(top + y) * WIDTH + (left + x)] = pix;
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// Main loop
+// Main loop + Skip-index RLE
 // -----------------------------------------------------------------------------
 
 frames.forEach((frame, frameIndex) => {
-    if (prevFrame) {
-        applyDisposal(prevFrame);
-    }
-
+    if (prevFrame) applyDisposal(prevFrame);
     blitFrame(frame);
 
     const tiles = extractTiles(gifFB);
-    const diffs = [];
 
-    if (!prevTiles) {
-        // Keyframe
+    const isKeyframe =
+        frameIndex === 0 || (KEYFRAME_INTERVAL > 0 && frameIndex % KEYFRAME_INTERVAL === 0);
+
+    const updates = [];
+
+    if (isKeyframe || !prevTiles) {
         for (let i = 0; i < TILE_COUNT; i++) {
-            diffs.push({ index: i, data: tiles[i] });
+            updates.push({ index: i, data: tiles[i] });
         }
     } else {
         for (let i = 0; i < TILE_COUNT; i++) {
             if (!tiles[i].equals(prevTiles[i])) {
-                diffs.push({ index: i, data: tiles[i] });
+                updates.push({ index: i, data: tiles[i] });
             }
         }
     }
 
-    // FrameHeader
-    const fh = Buffer.alloc(2);
-    fh.writeUInt16LE(diffs.length);
+    /*
+    FrameHeader v5
+    ----------------
+    uint8   flags   (bit0 = keyframe)
+    uint16  update_count
+    */
+
+    const fh = Buffer.alloc(3);
+    fh.writeUInt8(isKeyframe ? 1 : 0, 0);
+    fh.writeUInt16LE(updates.length, 1);
     fs.writeSync(out, fh);
 
-    // TileUpdates
-    for (const d of diffs) {
-        const rec = Buffer.alloc(2 + BYTES_PER_TILE);
-        rec.writeUInt16LE(d.index, 0);
-        d.data.copy(rec, 2);
-        fs.writeSync(out, rec);
+    /*
+    TileUpdate v5
+    ----------------
+    uint8   skip
+    bytes   tile_data   (ONLY if skip < 255)
+    */
+
+    let prevIndex = 0;
+
+    for (const u of updates) {
+        let skip = u.index - prevIndex;
+
+        while (skip >= 255) {
+            fs.writeSync(out, Buffer.from([255]));
+            skip -= 255;
+        }
+
+        fs.writeSync(out, Buffer.from([skip]));
+        fs.writeSync(out, u.data);
+
+        prevIndex = u.index + 1;
     }
 
     prevTiles = tiles;
     prevFrame = frame;
 
     if (frameIndex % 50 === 0) {
-        console.log(`frame ${frameIndex}/${frames.length}, changed tiles=${diffs.length}`);
+        console.log(
+            `frame ${frameIndex}/${frames.length} | ` +
+                (isKeyframe ? 'KEY' : 'diff') +
+                ` | updates=${updates.length}`
+        );
     }
 });
 
