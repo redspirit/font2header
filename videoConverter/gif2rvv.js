@@ -64,7 +64,8 @@ if (!gct || gct.length < PALETTE_SIZE) {
 const TILES_X = WIDTH / TILE;
 const TILES_Y = HEIGHT / TILE;
 const TILE_COUNT = TILES_X * TILES_Y;
-const BYTES_PER_TILE = (TILE * TILE * BPP) >> 3;
+const DIRECT_COLOR_8BPP = BPP === 8;
+const BYTES_PER_TILE = DIRECT_COLOR_8BPP ? TILE * TILE : (TILE * TILE * BPP) >> 3;
 
 console.log(`GIF ${WIDTH}x${HEIGHT}, frames=${frames.length}`);
 console.log(`RVV v5 | ${BPP}bpp | ${FPS}fps | KF=${KEYFRAME_INTERVAL || 'first only'}`);
@@ -96,7 +97,7 @@ let ho = 0;
 
 header.write('RVV', ho);
 ho += 3;
-header.writeUInt8(5, ho);
+header.writeUInt8(6, ho);
 ho += 1;
 header.writeUInt16LE(WIDTH, ho);
 ho += 2;
@@ -133,6 +134,24 @@ for (let i = 0; i < PALETTE_SIZE; i++) {
 // -----------------------------------------------------------------------------
 
 function packTile(pixels) {
+    // -----------------------------------------------------------------
+    // 8 BPP — прямой цвет RGB332
+    // -----------------------------------------------------------------
+    if (DIRECT_COLOR_8BPP) {
+        const buf = Buffer.alloc(BYTES_PER_TILE);
+        let i = 0;
+
+        for (const p of pixels) {
+            const [r, g, b] = gct[p];
+
+            buf[i++] = (r >> 5) | ((g >> 5) << 3) | (b & 0b11000000);
+        }
+        return buf;
+    }
+
+    // -----------------------------------------------------------------
+    // Indexed modes (1/2/4 bpp)
+    // -----------------------------------------------------------------
     const buf = Buffer.alloc(BYTES_PER_TILE);
     let bit = 0;
     let byte = 0;

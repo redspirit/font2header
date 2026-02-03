@@ -60,8 +60,8 @@
                 }
 
                 const version = data[3];
-                if (version < 5) {
-                    alert(`RVV version ${version} not supported (need v5+)`);
+                if (version < 6) {
+                    alert(`RVV version ${version} not supported (need v6+)`);
                     return;
                 }
 
@@ -103,7 +103,8 @@
                 const tilesX = width / tileW;
                 const tilesY = height / tileH;
                 const tileCount = tilesX * tilesY;
-                const bytesPerTile = (tileW * tileH * bpp) >> 3;
+                const directColor = bpp === 8;
+                const bytesPerTile = directColor ? tileW * tileH : (tileW * tileH * bpp) >> 3;
 
                 // -----------------------------------------------------------------
                 // Canvas / framebuffer
@@ -126,6 +127,24 @@
                     const tx = tileIndex % tilesX;
                     const ty = (tileIndex / tilesX) | 0;
 
+                    // -------------------------------------------------------------
+                    // 8 BPP — direct RGB332
+                    // -------------------------------------------------------------
+                    if (directColor) {
+                        let i = 0;
+                        for (let y = 0; y < tileH; y++) {
+                            for (let x = 0; x < tileW; x++) {
+                                const px = (ty * tileH + y) * width + (tx * tileW + x);
+
+                                fb[px] = tileData[i++];
+                            }
+                        }
+                        return;
+                    }
+
+                    // -------------------------------------------------------------
+                    // Indexed modes (1/2/4 bpp)
+                    // -------------------------------------------------------------
                     let bit = 0;
                     let byte = 0;
 
@@ -153,14 +172,37 @@
                 // -----------------------------------------------------------------
 
                 function render() {
-                    for (let i = 0; i < fb.length; i++) {
-                        const c = palette[fb[i]];
-                        const o = i * 4;
-                        img.data[o + 0] = c.r;
-                        img.data[o + 1] = c.g;
-                        img.data[o + 2] = c.b;
-                        img.data[o + 3] = 255;
+                    if (directColor) {
+                        // ---------------------------------------------------------
+                        // 8 BPP RGB332
+                        // ---------------------------------------------------------
+                        for (let i = 0; i < fb.length; i++) {
+                            const v = fb[i];
+
+                            const r = (v & 0b00000111) << 5;
+                            const g = (v & 0b00111000) << 2;
+                            const b = v & 0b11000000;
+
+                            const o = i * 4;
+                            img.data[o + 0] = r;
+                            img.data[o + 1] = g;
+                            img.data[o + 2] = b;
+                            img.data[o + 3] = 255;
+                        }
+                    } else {
+                        // ---------------------------------------------------------
+                        // Indexed palette modes
+                        // ---------------------------------------------------------
+                        for (let i = 0; i < fb.length; i++) {
+                            const c = palette[fb[i]];
+                            const o = i * 4;
+                            img.data[o + 0] = c.r;
+                            img.data[o + 1] = c.g;
+                            img.data[o + 2] = c.b;
+                            img.data[o + 3] = 255;
+                        }
                     }
+
                     ctx.putImageData(img, 0, 0);
                 }
 
