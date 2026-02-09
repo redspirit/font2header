@@ -2,7 +2,7 @@
 <html>
     <head>
         <meta charset="utf-8" />
-        <title>RV Player</title>
+        <title>RV v2 Player</title>
         <style>
             body {
                 background: #000;
@@ -15,13 +15,39 @@
                 display: block;
                 margin-top: 10px;
             }
+            button {
+                background: #111;
+                color: #0f0;
+                border: 1px solid #0f0;
+                padding: 4px 10px;
+                margin-right: 4px;
+                cursor: pointer;
+            }
+            button:hover {
+                background: #0f0;
+                color: #000;
+            }
+            .controls {
+                margin-top: 10px;
+            }
         </style>
     </head>
     <body>
-        <h3>RV Player (v1)</h3>
+        <h3>RV Player (v2)</h3>
 
         <input type="file" id="file" accept=".rv" />
         <div id="info"></div>
+
+        <div class="controls">
+            <b>Scale:</b>
+            <button id="scale1">1×</button>
+            <button id="scale2">2×</button>
+            <button id="scale4">4×</button>
+            &nbsp;&nbsp;
+            <button id="play">PLAY</button>
+            <button id="stop">STOP</button>
+        </div>
+
         <canvas id="screen"></canvas>
 
         <script>
@@ -30,7 +56,11 @@
             const ctx = canvas.getContext('2d');
             const info = document.getElementById('info');
 
+            const btnPlay = document.getElementById('play');
+            const btnStop = document.getElementById('stop');
+
             let timer = null;
+            let playing = false;
 
             function u16(buf, off) {
                 return buf[off] | (buf[off + 1] << 8);
@@ -46,21 +76,27 @@
                 );
             }
 
+            function setScale(scale) {
+                canvas.style.width = canvas.width * scale + 'px';
+                canvas.style.height = canvas.height * scale + 'px';
+            }
+
+            document.getElementById('scale1').onclick = () => setScale(1);
+            document.getElementById('scale2').onclick = () => setScale(2);
+            document.getElementById('scale4').onclick = () => setScale(4);
+
             fileInput.addEventListener('change', async (e) => {
                 const file = e.target.files[0];
                 if (!file) return;
 
-                if (timer) {
-                    clearInterval(timer);
-                    timer = null;
-                }
+                stopPlayback();
 
                 const buffer = await file.arrayBuffer();
                 const data = new Uint8Array(buffer);
                 let off = 0;
 
                 // -----------------------------------------------------------------
-                // Header (RV v1)
+                // Header (RV v2)
                 // -----------------------------------------------------------------
 
                 const magic = String.fromCharCode(data[0], data[1]);
@@ -70,7 +106,7 @@
                 }
 
                 const version = data[2];
-                if (version !== 1) {
+                if (version !== 2) {
                     alert(`Unsupported RV version ${version}`);
                     return;
                 }
@@ -80,8 +116,10 @@
                 const fps = u16(data, 7);
                 const frames = u32(data, 9);
                 const bpp = data[13];
+                const tileW = data[14];
+                const tileH = data[15];
 
-                off = 14;
+                off = 16;
 
                 if (bpp !== 8) {
                     alert('Only 8-bit RGB332 supported');
@@ -91,7 +129,15 @@
                 info.textContent =
                     `${file.name} | RV v${version} | ` +
                     `${width}x${height} | ${fps} fps | ` +
-                    `${frames} frames | RGB332`;
+                    `${frames} frames | tiles ${tileW}x${tileH}`;
+
+                // -----------------------------------------------------------------
+                // Geometry
+                // -----------------------------------------------------------------
+
+                const tilesX = width / tileW;
+                const tileCount = tilesX * (height / tileH);
+                const bytesPerTile = tileW * tileH;
 
                 // -----------------------------------------------------------------
                 // Canvas / framebuffer
@@ -99,21 +145,32 @@
 
                 canvas.width = width;
                 canvas.height = height;
+                setScale(2); // default zoom
 
                 const img = ctx.createImageData(width, height);
-                const pixelsPerFrame = width * height;
-
-                let frameIndex = 0;
+                const fb = new Uint8Array(width * height);
+                fb.fill(0);
 
                 // -----------------------------------------------------------------
-                // Render one frame
+                // Tile unpack
                 // -----------------------------------------------------------------
 
-                function renderFrame(frameData) {
-                    for (let i = 0; i < pixelsPerFrame; i++) {
-                        const v = frameData[i];
+                function unpackTile(tileData, tileIndex) {
+                    const tx = tileIndex % tilesX;
+                    const ty = (tileIndex / tilesX) | 0;
 
-                        // EXACT same decode as ESP32 inverse
+                    let i = 0;
+                    for (let y = 0; y < tileH; y++) {
+                        const row = (ty * tileH + y) * width + tx * tileW;
+                        for (let x = 0; x < tileW; x++) {
+                            fb[row + x] = tileData[i++];
+                        }
+                    }
+                }
+
+                function render() {
+                    for (let i = 0; i < fb.length; i++) {
+                        const v = fb[i];
                         const r = (v & 0b00000111) << 5;
                         const g = (v & 0b00111000) << 2;
                         const b = v & 0b11000000;
@@ -127,23 +184,67 @@
                     ctx.putImageData(img, 0, 0);
                 }
 
-                // -----------------------------------------------------------------
-                // Playback loop
-                // -----------------------------------------------------------------
+                let frameIndex = 0;
+                let dataOffset = off;
 
-                timer = setInterval(() => {
+                function playTick() {
                     if (frameIndex >= frames) {
-                        clearInterval(timer);
+                        stopPlayback();
                         return;
                     }
 
-                    const frameData = data.subarray(off, off + pixelsPerFrame);
-                    off += pixelsPerFrame;
+                    const flags = data[dataOffset++];
+                    const updateCount = u16(data, dataOffset);
+                    dataOffset += 2;
 
-                    renderFrame(frameData);
+                    let tileIndex = 0;
+
+                    for (let i = 0; i < updateCount; i++) {
+                        let skip;
+                        do {
+                            skip = data[dataOffset++];
+                            tileIndex += skip;
+                        } while (skip === 255);
+
+                        const tile = data.subarray(dataOffset, dataOffset + bytesPerTile);
+                        dataOffset += bytesPerTile;
+
+                        unpackTile(tile, tileIndex);
+                        tileIndex++;
+                    }
+
+                    render();
                     frameIndex++;
-                }, 1000 / fps);
+                }
+
+                function startPlayback() {
+                    if (playing) return;
+                    playing = true;
+                    timer = setInterval(playTick, 1000 / fps);
+                }
+
+                function stopPlayback() {
+                    playing = false;
+                    if (timer) {
+                        clearInterval(timer);
+                        timer = null;
+                    }
+                }
+
+                btnPlay.onclick = startPlayback;
+                btnStop.onclick = stopPlayback;
+
+                // autoplay first frame
+                playTick();
             });
+
+            function stopPlayback() {
+                if (timer) {
+                    clearInterval(timer);
+                    timer = null;
+                }
+                playing = false;
+            }
         </script>
     </body>
 </html>
