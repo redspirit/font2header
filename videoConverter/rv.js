@@ -189,6 +189,12 @@ ffmpegVideo.on('close', () => {
 
     console.log('[FFMPEG] start AUDIO');
 
+    if ((videoSize & 1) !== 0) {
+        console.log('[ALIGN] padding 1 byte before audio');
+        fs.writeSync(out, Buffer.from([0]));
+        videoSize += 1;
+    }    
+
     const audioOffset = HEADER_SIZE + videoSize;
     let audioSamples = 0;
 
