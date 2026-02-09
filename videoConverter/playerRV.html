@@ -33,7 +33,7 @@
         </style>
     </head>
     <body>
-        <h3>RV Player (v2)</h3>
+        <h3>RV Player (v3)</h3>
 
         <input type="file" id="file" accept=".rv" />
         <div id="info"></div>
@@ -44,8 +44,7 @@
             <button id="scale2">2×</button>
             <button id="scale4">4×</button>
             &nbsp;&nbsp;
-            <button id="play">PLAY</button>
-            <button id="stop">STOP</button>
+            <button id="pause">PAUSE</button>
         </div>
 
         <canvas id="screen"></canvas>
@@ -56,8 +55,7 @@
             const ctx = canvas.getContext('2d');
             const info = document.getElementById('info');
 
-            const btnPlay = document.getElementById('play');
-            const btnStop = document.getElementById('stop');
+            const btnPause = document.getElementById('pause');
 
             let timer = null;
             let playing = false;
@@ -96,7 +94,7 @@
                 let off = 0;
 
                 // -----------------------------------------------------------------
-                // Header (RV v2)
+                // Header
                 // -----------------------------------------------------------------
 
                 const magic = String.fromCharCode(data[0], data[1]);
@@ -106,7 +104,7 @@
                 }
 
                 const version = data[2];
-                if (version !== 2) {
+                if (version !== 2 && version !== 3) {
                     alert(`Unsupported RV version ${version}`);
                     return;
                 }
@@ -121,23 +119,17 @@
 
                 off = 16;
 
-                if (bpp !== 8) {
-                    alert('Only 8-bit RGB332 supported');
-                    return;
-                }
-
                 info.textContent =
                     `${file.name} | RV v${version} | ` +
                     `${width}x${height} | ${fps} fps | ` +
-                    `${frames} frames | tiles ${tileW}x${tileH}`;
+                    `${frames} frames | ${bpp} bpp`;
 
                 // -----------------------------------------------------------------
                 // Geometry
                 // -----------------------------------------------------------------
 
                 const tilesX = width / tileW;
-                const tileCount = tilesX * (height / tileH);
-                const bytesPerTile = tileW * tileH;
+                const bytesPerTile = tileW * tileH * (bpp === 9 ? 2 : 1);
 
                 // -----------------------------------------------------------------
                 // Canvas / framebuffer
@@ -145,10 +137,13 @@
 
                 canvas.width = width;
                 canvas.height = height;
-                setScale(2); // default zoom
+                setScale(2);
 
                 const img = ctx.createImageData(width, height);
-                const fb = new Uint8Array(width * height);
+
+                const fb =
+                    bpp === 9 ? new Uint16Array(width * height) : new Uint8Array(width * height);
+
                 fb.fill(0);
 
                 // -----------------------------------------------------------------
@@ -159,21 +154,39 @@
                     const tx = tileIndex % tilesX;
                     const ty = (tileIndex / tilesX) | 0;
 
-                    let i = 0;
+                    let o = 0;
                     for (let y = 0; y < tileH; y++) {
                         const row = (ty * tileH + y) * width + tx * tileW;
                         for (let x = 0; x < tileW; x++) {
-                            fb[row + x] = tileData[i++];
+                            if (bpp === 9) {
+                                fb[row + x] = tileData[o] | (tileData[o + 1] << 8);
+                                o += 2;
+                            } else {
+                                fb[row + x] = tileData[o++];
+                            }
                         }
                     }
                 }
 
+                // -----------------------------------------------------------------
+                // Render
+                // -----------------------------------------------------------------
+
                 function render() {
                     for (let i = 0; i < fb.length; i++) {
-                        const v = fb[i];
-                        const r = (v & 0b00000111) << 5;
-                        const g = (v & 0b00111000) << 2;
-                        const b = v & 0b11000000;
+                        let r, g, b;
+
+                        if (bpp === 9) {
+                            const v = fb[i];
+                            r = (v & 0b000000111) << 5;
+                            g = ((v >> 3) & 0b000000111) << 5;
+                            b = ((v >> 6) & 0b000000111) << 5;
+                        } else {
+                            const v = fb[i];
+                            r = (v & 0b00000111) << 5;
+                            g = (v & 0b00111000) << 2;
+                            b = v & 0b11000000;
+                        }
 
                         const o = i * 4;
                         img.data[o + 0] = r;
@@ -183,6 +196,10 @@
                     }
                     ctx.putImageData(img, 0, 0);
                 }
+
+                // -----------------------------------------------------------------
+                // Playback
+                // -----------------------------------------------------------------
 
                 let frameIndex = 0;
                 let dataOffset = off;
@@ -217,24 +234,28 @@
                     frameIndex++;
                 }
 
-                function startPlayback() {
-                    if (playing) return;
-                    playing = true;
-                    timer = setInterval(playTick, 1000 / fps);
+                function togglePause() {
+                    if (playing) {
+                        stopPlayback();
+                    } else {
+                        playing = true;
+                        btnPause.textContent = 'PAUSE';
+                        timer = setInterval(playTick, 1000 / fps);
+                    }
                 }
 
                 function stopPlayback() {
                     playing = false;
+                    btnPause.textContent = 'PLAY';
                     if (timer) {
                         clearInterval(timer);
                         timer = null;
                     }
                 }
 
-                btnPlay.onclick = startPlayback;
-                btnStop.onclick = stopPlayback;
+                btnPause.onclick = togglePause;
 
-                // autoplay first frame
+                // draw first frame
                 playTick();
             });
 

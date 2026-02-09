@@ -19,8 +19,8 @@ const INPUT = argv.file;
 const OUTPUT = argv.output;
 const BITS = argv.bits;
 
-if (BITS !== 8) {
-    throw new Error('RV v2 supports only --bits=8');
+if (BITS !== 8 && BITS !== 9) {
+    throw new Error('--bits must be 8 or 9');
 }
 
 // -----------------------------------------------------------------------------
@@ -29,7 +29,10 @@ if (BITS !== 8) {
 
 const TILE_W = 8;
 const TILE_H = 8;
-const BYTES_PER_TILE = TILE_W * TILE_H;
+
+const BYTES_PER_PIXEL = BITS === 8 ? 1 : 2;
+const BYTES_PER_TILE = TILE_W * TILE_H * BYTES_PER_PIXEL;
+const RV_VERSION = BITS === 8 ? 2 : 3;
 
 // -----------------------------------------------------------------------------
 // ffprobe
@@ -54,7 +57,6 @@ function probeVideo(file) {
         ffprobe.on('close', () => {
             const s = JSON.parse(out).streams[0];
             const [n, d] = s.r_frame_rate.split('/').map(Number);
-
             resolve({
                 width: s.width,
                 height: s.height,
@@ -66,18 +68,22 @@ function probeVideo(file) {
 }
 
 // -----------------------------------------------------------------------------
-// RGB888 → RGB332 (ESP32 native)
+// Color encoding (FIXED ABI)
 // -----------------------------------------------------------------------------
 
 function rgb332(r, g, b) {
     return (r >> 5) | ((g >> 5) << 3) | (b & 0b11000000);
 }
 
+function rgb333(r, g, b) {
+    return ((b >> 5) << 6) | ((g >> 5) << 3) | (r >> 5);
+}
+
 // -----------------------------------------------------------------------------
 // Tile extraction
 // -----------------------------------------------------------------------------
 
-function extractTiles(frame332, width, height) {
+function extractTiles(frame, width, height) {
     const tilesX = width / TILE_W;
     const tilesY = height / TILE_H;
     const tiles = [];
@@ -85,12 +91,18 @@ function extractTiles(frame332, width, height) {
     for (let ty = 0; ty < tilesY; ty++) {
         for (let tx = 0; tx < tilesX; tx++) {
             const tile = Buffer.alloc(BYTES_PER_TILE);
-            let i = 0;
+            let o = 0;
 
             for (let y = 0; y < TILE_H; y++) {
                 const row = (ty * TILE_H + y) * width + tx * TILE_W;
                 for (let x = 0; x < TILE_W; x++) {
-                    tile[i++] = frame332[row + x];
+                    const v = frame[row + x];
+                    if (BITS === 8) {
+                        tile[o++] = v;
+                    } else {
+                        tile.writeUInt16LE(v, o);
+                        o += 2;
+                    }
                 }
             }
             tiles.push(tile);
@@ -111,12 +123,11 @@ function extractTiles(frame332, width, height) {
     }
 
     const frameRGBSize = width * height * 3;
-    const frame332Size = width * height;
-    const tilesPerFrame = (width / 8) * (height / 8);
+    const framePixels = width * height;
 
-    console.log(`RV v2`);
+    console.log(`RV v${RV_VERSION}`);
     console.log(`${width}x${height} @ ${fps} fps`);
-    console.log(`Tiles: ${tilesPerFrame}`);
+    console.log(`Bits per pixel: ${BITS}`);
 
     const out = fs.openSync(OUTPUT, 'w');
 
@@ -129,7 +140,7 @@ function extractTiles(frame332, width, height) {
 
     header.write('RV', o);
     o += 2;
-    header.writeUInt8(2, o);
+    header.writeUInt8(RV_VERSION, o);
     o += 1;
     header.writeUInt16LE(width, o);
     o += 2;
@@ -139,7 +150,7 @@ function extractTiles(frame332, width, height) {
     o += 2;
     header.writeUInt32LE(frames, o);
     o += 4;
-    header.writeUInt8(8, o);
+    header.writeUInt8(BITS, o);
     o += 1;
     header.writeUInt8(TILE_W, o);
     o += 1;
@@ -176,22 +187,24 @@ function extractTiles(frame332, width, height) {
             rgbBuf = rgbBuf.subarray(frameRGBSize);
 
             // -------------------------------------------------------------
-            // Quantize to RGB332
+            // Quantize frame
             // -------------------------------------------------------------
-            const frame332 = Buffer.alloc(frame332Size);
-            for (let i = 0, j = 0; i < frame332Size; i++) {
-                frame332[i] = rgb332(rgb[j++], rgb[j++], rgb[j++]);
+            const frame = BITS === 8 ? Buffer.alloc(framePixels) : new Uint16Array(framePixels);
+
+            for (let i = 0, j = 0; i < framePixels; i++) {
+                const r = rgb[j++];
+                const g = rgb[j++];
+                const b = rgb[j++];
+
+                frame[i] = BITS === 8 ? rgb332(r, g, b) : rgb333(r, g, b);
             }
 
-            const tiles = extractTiles(frame332, width, height);
-
-            const isKeyframe = frameIndex === 0;
+            const tiles = extractTiles(frame, width, height);
             const updates = [];
+            const isKeyframe = frameIndex === 0;
 
             if (isKeyframe || !prevTiles) {
-                for (let i = 0; i < tiles.length; i++) {
-                    updates.push({ index: i, data: tiles[i] });
-                }
+                tiles.forEach((t, i) => updates.push({ index: i, data: t }));
             } else {
                 for (let i = 0; i < tiles.length; i++) {
                     if (!tiles[i].equals(prevTiles[i])) {
@@ -215,15 +228,12 @@ function extractTiles(frame332, width, height) {
 
             for (const u of updates) {
                 let skip = u.index - prevIndex;
-
                 while (skip >= 255) {
                     fs.writeSync(out, Buffer.from([255]));
                     skip -= 255;
                 }
-
                 fs.writeSync(out, Buffer.from([skip]));
                 fs.writeSync(out, u.data);
-
                 prevIndex = u.index + 1;
             }
 
