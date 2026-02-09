@@ -2,7 +2,7 @@
 <html>
     <head>
         <meta charset="utf-8" />
-        <title>RV v2 Player</title>
+        <title>RV Player (v3/v4 debug)</title>
         <style>
             body {
                 background: #000;
@@ -32,8 +32,9 @@
             }
         </style>
     </head>
+
     <body>
-        <h3>RV Player (v3)</h3>
+        <h3>RV Player (v3 / v4 DEBUG)</h3>
 
         <input type="file" id="file" accept=".rv" />
         <div id="info"></div>
@@ -44,7 +45,7 @@
             <button id="scale2">2×</button>
             <button id="scale4">4×</button>
             &nbsp;&nbsp;
-            <button id="pause">PAUSE</button>
+            <button id="pause">PLAY</button>
         </div>
 
         <canvas id="screen"></canvas>
@@ -54,16 +55,16 @@
             const canvas = document.getElementById('screen');
             const ctx = canvas.getContext('2d');
             const info = document.getElementById('info');
-
             const btnPause = document.getElementById('pause');
 
             let timer = null;
             let playing = false;
 
+            // ---------------- utils ----------------
+
             function u16(buf, off) {
                 return buf[off] | (buf[off + 1] << 8);
             }
-
             function u32(buf, off) {
                 return (
                     (buf[off] |
@@ -83,28 +84,71 @@
             document.getElementById('scale2').onclick = () => setScale(2);
             document.getElementById('scale4').onclick = () => setScale(4);
 
+            // ---------------- audio ----------------
+
+            let audioCtx = null;
+            let audioNode = null;
+            let pcm = null;
+            let pcmPos = 0;
+            let audioRate = 0;
+
+            function initAudio() {
+                if (!pcm || pcm.length === 0) {
+                    console.warn('[AUDIO] No PCM data');
+                    return;
+                }
+
+                console.log('[AUDIO] init, samples =', pcm.length, 'rate =', audioRate);
+
+                audioCtx = new AudioContext({ sampleRate: audioRate });
+                audioNode = audioCtx.createScriptProcessor(1024, 0, 1);
+
+                audioNode.onaudioprocess = (e) => {
+                    const out = e.outputBuffer.getChannelData(0);
+
+                    for (let i = 0; i < out.length; i++) {
+                        if (pcmPos < pcm.length) {
+                            out[i] = pcm[pcmPos++] / 32768;
+                        } else {
+                            out[i] = 0;
+                            console.warn('[AUDIO] end of PCM');
+                            stopPlayback();
+                            audioCtx.suspend();
+                            return;
+                        }
+                    }
+                };
+
+                audioNode.connect(audioCtx.destination);
+            }
+
+            // ---------------- file load ----------------
+
             fileInput.addEventListener('change', async (e) => {
                 const file = e.target.files[0];
                 if (!file) return;
 
                 stopPlayback();
 
+                console.log('[FILE] loading', file.name);
+
                 const buffer = await file.arrayBuffer();
                 const data = new Uint8Array(buffer);
                 let off = 0;
 
-                // -----------------------------------------------------------------
-                // Header
-                // -----------------------------------------------------------------
+                // ---------------- header ----------------
 
                 const magic = String.fromCharCode(data[0], data[1]);
+                const version = data[2];
+
+                console.log('[HDR] magic=', magic, 'version=', version);
+
                 if (magic !== 'RV') {
                     alert('Not an RV file');
                     return;
                 }
 
-                const version = data[2];
-                if (version !== 2 && version !== 3) {
+                if (version !== 2 && version !== 3 && version !== 4) {
                     alert(`Unsupported RV version ${version}`);
                     return;
                 }
@@ -117,44 +161,61 @@
                 const tileW = data[14];
                 const tileH = data[15];
 
-                off = 16;
+                let videoOffset = 16;
+                let audioOffset = 0;
+                let audioSamples = 0;
+
+                if (version === 4) {
+                    videoOffset = u32(data, 16);
+                    audioOffset = u32(data, 20);
+                    audioRate = u32(data, 24);
+                    audioSamples = u32(data, 28);
+
+                    console.log('[HDR] videoOffset=', videoOffset);
+                    console.log('[HDR] audioOffset=', audioOffset);
+                    console.log('[HDR] audioRate=', audioRate);
+                    console.log('[HDR] audioSamples=', audioSamples);
+                }
 
                 info.textContent =
                     `${file.name} | RV v${version} | ` +
-                    `${width}x${height} | ${fps} fps | ` +
-                    `${frames} frames | ${bpp} bpp`;
+                    `${width}x${height} | ${fps} fps | ${bpp} bpp`;
 
-                // -----------------------------------------------------------------
-                // Geometry
-                // -----------------------------------------------------------------
+                // ---------------- audio data ----------------
+
+                if (version === 4 && audioSamples > 0) {
+                    pcm = new Int16Array(data.buffer, audioOffset, audioSamples);
+                    pcmPos = 0;
+                    console.log('[AUDIO] PCM loaded, first samples:', pcm.slice(0, 8));
+                    initAudio();
+                    audioCtx.suspend();
+                } else {
+                    pcm = null;
+                }
+
+                // ---------------- video ----------------
 
                 const tilesX = width / tileW;
                 const bytesPerTile = tileW * tileH * (bpp === 9 ? 2 : 1);
-
-                // -----------------------------------------------------------------
-                // Canvas / framebuffer
-                // -----------------------------------------------------------------
 
                 canvas.width = width;
                 canvas.height = height;
                 setScale(2);
 
                 const img = ctx.createImageData(width, height);
-
                 const fb =
                     bpp === 9 ? new Uint16Array(width * height) : new Uint8Array(width * height);
 
                 fb.fill(0);
 
-                // -----------------------------------------------------------------
-                // Tile unpack
-                // -----------------------------------------------------------------
+                let frameIndex = 0;
+                let dataOffset = videoOffset;
 
                 function unpackTile(tileData, tileIndex) {
                     const tx = tileIndex % tilesX;
                     const ty = (tileIndex / tilesX) | 0;
-
                     let o = 0;
+
                     for (let y = 0; y < tileH; y++) {
                         const row = (ty * tileH + y) * width + tx * tileW;
                         for (let x = 0; x < tileW; x++) {
@@ -168,28 +229,22 @@
                     }
                 }
 
-                // -----------------------------------------------------------------
-                // Render
-                // -----------------------------------------------------------------
-
                 function render() {
                     for (let i = 0; i < fb.length; i++) {
                         let r, g, b;
-
                         if (bpp === 9) {
                             const v = fb[i];
-                            r = (v & 0b000000111) << 5;
-                            g = ((v >> 3) & 0b000000111) << 5;
-                            b = ((v >> 6) & 0b000000111) << 5;
+                            r = (v & 7) << 5;
+                            g = ((v >> 3) & 7) << 5;
+                            b = ((v >> 6) & 7) << 5;
                         } else {
                             const v = fb[i];
-                            r = (v & 0b00000111) << 5;
-                            g = (v & 0b00111000) << 2;
-                            b = v & 0b11000000;
+                            r = (v & 7) << 5;
+                            g = (v & 56) << 2;
+                            b = v & 192;
                         }
-
                         const o = i * 4;
-                        img.data[o + 0] = r;
+                        img.data[o] = r;
                         img.data[o + 1] = g;
                         img.data[o + 2] = b;
                         img.data[o + 3] = 255;
@@ -197,15 +252,9 @@
                     ctx.putImageData(img, 0, 0);
                 }
 
-                // -----------------------------------------------------------------
-                // Playback
-                // -----------------------------------------------------------------
-
-                let frameIndex = 0;
-                let dataOffset = off;
-
                 function playTick() {
                     if (frameIndex >= frames) {
+                        console.log('[VIDEO] end of video');
                         stopPlayback();
                         return;
                     }
@@ -213,6 +262,8 @@
                     const flags = data[dataOffset++];
                     const updateCount = u16(data, dataOffset);
                     dataOffset += 2;
+
+                    console.log('[VIDEO] frame', frameIndex, 'updates', updateCount);
 
                     let tileIndex = 0;
 
@@ -240,6 +291,12 @@
                     } else {
                         playing = true;
                         btnPause.textContent = 'PAUSE';
+
+                        if (audioCtx && audioCtx.state !== 'running') {
+                            audioCtx.resume();
+                            console.log('[AUDIO] resume at sample', pcmPos);
+                        }
+
                         timer = setInterval(playTick, 1000 / fps);
                     }
                 }
@@ -247,24 +304,29 @@
                 function stopPlayback() {
                     playing = false;
                     btnPause.textContent = 'PLAY';
+
                     if (timer) {
                         clearInterval(timer);
                         timer = null;
+                    }
+
+                    if (audioCtx && audioCtx.state === 'running') {
+                        audioCtx.suspend();
+                        console.log('[AUDIO] paused at sample', pcmPos);
                     }
                 }
 
                 btnPause.onclick = togglePause;
 
-                // draw first frame
+                // первый кадр
                 playTick();
             });
 
+            // global stop
             function stopPlayback() {
-                if (timer) {
-                    clearInterval(timer);
-                    timer = null;
-                }
                 playing = false;
+                if (timer) clearInterval(timer);
+                timer = null;
             }
         </script>
     </body>

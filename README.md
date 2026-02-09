@@ -6,3 +6,5 @@ ffmpeg -i tetoris.mp4 -i palette.png -filter_complex "fps=30,scale=320:180:flags
 
 CLI
 videoConverter/gif2rvv.js /home/spirit/Видео/dan.gif --output dan.rvv --bpp 8 --fps 24
+
+ffmpeg -i tetoris.mp4 -f s16le -af "volume=0.25" -acodec pcm_s16le -ac 1 -ar 11025 tetoris.pcm

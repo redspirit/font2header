@@ -13,15 +13,18 @@ const argv = yargs(hideBin(process.argv))
     .option('file', { type: 'string', demandOption: true })
     .option('output', { type: 'string', demandOption: true })
     .option('bits', { type: 'number', demandOption: true })
+    .option('res', { type: 'string', demandOption: true })
+    .option('volume', { type: 'number', demandOption: true })
     .help().argv;
 
-const INPUT = argv.file;
-const OUTPUT = argv.output;
-const BITS = argv.bits;
-
-if (BITS !== 8 && BITS !== 9) {
+if (![8, 9].includes(argv.bits)) {
     throw new Error('--bits must be 8 or 9');
 }
+
+const [WIDTH, HEIGHT] = argv.res.split(':').map(Number);
+if (!WIDTH || !HEIGHT) throw new Error('Invalid --res');
+
+const VOLUME = argv.volume / 100;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -29,46 +32,14 @@ if (BITS !== 8 && BITS !== 9) {
 
 const TILE_W = 8;
 const TILE_H = 8;
-
-const BYTES_PER_PIXEL = BITS === 8 ? 1 : 2;
+const BYTES_PER_PIXEL = argv.bits === 8 ? 1 : 2;
 const BYTES_PER_TILE = TILE_W * TILE_H * BYTES_PER_PIXEL;
-const RV_VERSION = BITS === 8 ? 2 : 3;
+
+const AUDIO_RATE = 11025;
+const FPS = 30;
 
 // -----------------------------------------------------------------------------
-// ffprobe
-// -----------------------------------------------------------------------------
-
-function probeVideo(file) {
-    return new Promise((resolve) => {
-        const ffprobe = spawn('ffprobe', [
-            '-v',
-            'error',
-            '-select_streams',
-            'v:0',
-            '-show_entries',
-            'stream=width,height,r_frame_rate,nb_frames',
-            '-of',
-            'json',
-            file,
-        ]);
-
-        let out = '';
-        ffprobe.stdout.on('data', (d) => (out += d));
-        ffprobe.on('close', () => {
-            const s = JSON.parse(out).streams[0];
-            const [n, d] = s.r_frame_rate.split('/').map(Number);
-            resolve({
-                width: s.width,
-                height: s.height,
-                fps: Math.round(n / d),
-                frames: Number(s.nb_frames),
-            });
-        });
-    });
-}
-
-// -----------------------------------------------------------------------------
-// Color encoding (FIXED ABI)
+// Color encoding
 // -----------------------------------------------------------------------------
 
 function rgb332(r, g, b) {
@@ -83,9 +54,9 @@ function rgb333(r, g, b) {
 // Tile extraction
 // -----------------------------------------------------------------------------
 
-function extractTiles(frame, width, height) {
-    const tilesX = width / TILE_W;
-    const tilesY = height / TILE_H;
+function extractTiles(frame) {
+    const tilesX = WIDTH / TILE_W;
+    const tilesY = HEIGHT / TILE_H;
     const tiles = [];
 
     for (let ty = 0; ty < tilesY; ty++) {
@@ -94,10 +65,10 @@ function extractTiles(frame, width, height) {
             let o = 0;
 
             for (let y = 0; y < TILE_H; y++) {
-                const row = (ty * TILE_H + y) * width + tx * TILE_W;
+                const row = (ty * TILE_H + y) * WIDTH + tx * TILE_W;
                 for (let x = 0; x < TILE_W; x++) {
                     const v = frame[row + x];
-                    if (BITS === 8) {
+                    if (argv.bits === 8) {
                         tile[o++] = v;
                     } else {
                         tile.writeUInt16LE(v, o);
@@ -112,142 +83,182 @@ function extractTiles(frame, width, height) {
 }
 
 // -----------------------------------------------------------------------------
-// Main
+// Output file
 // -----------------------------------------------------------------------------
 
-(async () => {
-    const { width, height, fps, frames } = await probeVideo(INPUT);
+const out = fs.openSync(argv.output, 'w');
 
-    if (width % TILE_W || height % TILE_H) {
-        throw new Error('Width/height must be divisible by 8');
+const HEADER_SIZE = 2 + 1 + 2 + 2 + 2 + 4 + 1 + 1 + 1 + 4 + 4 + 4 + 4;
+
+fs.writeSync(out, Buffer.alloc(HEADER_SIZE));
+console.log('[OUT] header reserved');
+
+// -----------------------------------------------------------------------------
+// VIDEO PHASE
+// -----------------------------------------------------------------------------
+
+console.log('[FFMPEG] start VIDEO');
+
+const ffmpegVideo = spawn('ffmpeg', [
+    '-i',
+    argv.file,
+    '-vf',
+    `scale=${WIDTH}:${HEIGHT}:flags=bicubic,format=rgb24`,
+    '-f',
+    'rawvideo',
+    '-pix_fmt',
+    'rgb24',
+    '-vsync',
+    '0',
+    'pipe:1',
+]);
+
+const frameRGBSize = WIDTH * HEIGHT * 3;
+const framePixels = WIDTH * HEIGHT;
+
+let rgbBuf = Buffer.alloc(0);
+let prevTiles = null;
+let frameIndex = 0;
+let videoSize = 0;
+
+ffmpegVideo.stdout.on('data', (chunk) => {
+    rgbBuf = Buffer.concat([rgbBuf, chunk]);
+
+    while (rgbBuf.length >= frameRGBSize) {
+        const rgb = rgbBuf.subarray(0, frameRGBSize);
+        rgbBuf = rgbBuf.subarray(frameRGBSize);
+
+        const frame = argv.bits === 8 ? Buffer.alloc(framePixels) : new Uint16Array(framePixels);
+
+        for (let i = 0, j = 0; i < framePixels; i++) {
+            const r = rgb[j++];
+            const g = rgb[j++];
+            const b = rgb[j++];
+            frame[i] = argv.bits === 8 ? rgb332(r, g, b) : rgb333(r, g, b);
+        }
+
+        const tiles = extractTiles(frame);
+        const updates = [];
+        const keyframe = frameIndex === 0;
+
+        if (keyframe || !prevTiles) {
+            tiles.forEach((t, i) => updates.push({ index: i, data: t }));
+        } else {
+            for (let i = 0; i < tiles.length; i++) {
+                if (!tiles[i].equals(prevTiles[i])) {
+                    updates.push({ index: i, data: tiles[i] });
+                }
+            }
+        }
+
+        const fh = Buffer.alloc(3);
+        fh.writeUInt8(keyframe ? 1 : 0, 0);
+        fh.writeUInt16LE(updates.length, 1);
+        fs.writeSync(out, fh);
+        videoSize += 3;
+
+        let prev = 0;
+        for (const u of updates) {
+            let skip = u.index - prev;
+            while (skip >= 255) {
+                fs.writeSync(out, Buffer.from([255]));
+                videoSize++;
+                skip -= 255;
+            }
+            fs.writeSync(out, Buffer.from([skip]));
+            fs.writeSync(out, u.data);
+            videoSize += 1 + u.data.length;
+            prev = u.index + 1;
+        }
+
+        prevTiles = tiles;
+        frameIndex++;
+
+        if ((frameIndex & 16) === 0) {
+            //console.log('[VIDEO] frame', frameIndex);
+        }
     }
+});
 
-    const frameRGBSize = width * height * 3;
-    const framePixels = width * height;
-
-    console.log(`RV v${RV_VERSION}`);
-    console.log(`${width}x${height} @ ${fps} fps`);
-    console.log(`Bits per pixel: ${BITS}`);
-
-    const out = fs.openSync(OUTPUT, 'w');
+ffmpegVideo.on('close', () => {
+    console.log('[VIDEO] done, frames =', frameIndex);
 
     // -------------------------------------------------------------------------
-    // Header
+    // AUDIO PHASE (START ONLY NOW)
     // -------------------------------------------------------------------------
 
-    const header = Buffer.alloc(16);
+    console.log('[FFMPEG] start AUDIO');
+
+    const audioOffset = HEADER_SIZE + videoSize;
+    let audioSamples = 0;
+
+    const ffmpegAudio = spawn('ffmpeg', [
+        '-i',
+        argv.file,
+        '-f',
+        's16le',
+        '-af',
+        `volume=${VOLUME}`,
+        '-acodec',
+        'pcm_s16le',
+        '-ac',
+        '1',
+        '-ar',
+        AUDIO_RATE.toString(),
+        'pipe:1',
+    ]);
+
+    ffmpegAudio.stdout.on('data', (chunk) => {
+        fs.writeSync(out, chunk, 0, chunk.length, audioOffset + audioSamples * 2);
+        audioSamples += chunk.length / 2;
+    });
+
+    ffmpegAudio.on('close', () => {
+        console.log('[AUDIO] done, samples =', audioSamples);
+
+        finalize(audioOffset, audioSamples);
+    });
+});
+
+// -----------------------------------------------------------------------------
+// FINALIZE
+// -----------------------------------------------------------------------------
+
+function finalize(audioOffset, audioSamples) {
+    console.log('[FINALIZE] write header');
+
+    const header = Buffer.alloc(HEADER_SIZE);
     let o = 0;
 
     header.write('RV', o);
     o += 2;
-    header.writeUInt8(RV_VERSION, o);
+    header.writeUInt8(4, o);
     o += 1;
-    header.writeUInt16LE(width, o);
+    header.writeUInt16LE(WIDTH, o);
     o += 2;
-    header.writeUInt16LE(height, o);
+    header.writeUInt16LE(HEIGHT, o);
     o += 2;
-    header.writeUInt16LE(fps, o);
+    header.writeUInt16LE(FPS, o);
     o += 2;
-    header.writeUInt32LE(frames, o);
+    header.writeUInt32LE(frameIndex, o);
     o += 4;
-    header.writeUInt8(BITS, o);
+    header.writeUInt8(argv.bits, o);
     o += 1;
     header.writeUInt8(TILE_W, o);
     o += 1;
     header.writeUInt8(TILE_H, o);
     o += 1;
+    header.writeUInt32LE(HEADER_SIZE, o);
+    o += 4; // videoOffset
+    header.writeUInt32LE(audioOffset, o);
+    o += 4;
+    header.writeUInt32LE(AUDIO_RATE, o);
+    o += 4;
+    header.writeUInt32LE(audioSamples, o);
+    o += 4;
 
-    fs.writeSync(out, header);
+    fs.writeSync(out, header, 0, header.length, 0);
+    fs.closeSync(out);
 
-    // -------------------------------------------------------------------------
-    // ffmpeg
-    // -------------------------------------------------------------------------
-
-    const ffmpeg = spawn('ffmpeg', [
-        '-i',
-        INPUT,
-        '-f',
-        'rawvideo',
-        '-pix_fmt',
-        'rgb24',
-        '-vsync',
-        '0',
-        'pipe:1',
-    ]);
-
-    let rgbBuf = Buffer.alloc(0);
-    let prevTiles = null;
-    let frameIndex = 0;
-
-    ffmpeg.stdout.on('data', (chunk) => {
-        rgbBuf = Buffer.concat([rgbBuf, chunk]);
-
-        while (rgbBuf.length >= frameRGBSize) {
-            const rgb = rgbBuf.subarray(0, frameRGBSize);
-            rgbBuf = rgbBuf.subarray(frameRGBSize);
-
-            // -------------------------------------------------------------
-            // Quantize frame
-            // -------------------------------------------------------------
-            const frame = BITS === 8 ? Buffer.alloc(framePixels) : new Uint16Array(framePixels);
-
-            for (let i = 0, j = 0; i < framePixels; i++) {
-                const r = rgb[j++];
-                const g = rgb[j++];
-                const b = rgb[j++];
-
-                frame[i] = BITS === 8 ? rgb332(r, g, b) : rgb333(r, g, b);
-            }
-
-            const tiles = extractTiles(frame, width, height);
-            const updates = [];
-            const isKeyframe = frameIndex === 0;
-
-            if (isKeyframe || !prevTiles) {
-                tiles.forEach((t, i) => updates.push({ index: i, data: t }));
-            } else {
-                for (let i = 0; i < tiles.length; i++) {
-                    if (!tiles[i].equals(prevTiles[i])) {
-                        updates.push({ index: i, data: tiles[i] });
-                    }
-                }
-            }
-
-            // -------------------------------------------------------------
-            // FrameHeader
-            // -------------------------------------------------------------
-            const fh = Buffer.alloc(3);
-            fh.writeUInt8(isKeyframe ? 1 : 0, 0);
-            fh.writeUInt16LE(updates.length, 1);
-            fs.writeSync(out, fh);
-
-            // -------------------------------------------------------------
-            // Tile updates (skip RLE)
-            // -------------------------------------------------------------
-            let prevIndex = 0;
-
-            for (const u of updates) {
-                let skip = u.index - prevIndex;
-                while (skip >= 255) {
-                    fs.writeSync(out, Buffer.from([255]));
-                    skip -= 255;
-                }
-                fs.writeSync(out, Buffer.from([skip]));
-                fs.writeSync(out, u.data);
-                prevIndex = u.index + 1;
-            }
-
-            prevTiles = tiles;
-            frameIndex++;
-
-            if ((frameIndex & 7) === 0) {
-                process.stdout.write(`\rFrame ${frameIndex}/${frames}`);
-            }
-        }
-    });
-
-    ffmpeg.on('close', () => {
-        fs.closeSync(out);
-        console.log(`\nDONE ✔ ${OUTPUT}`);
-    });
-})();
+    console.log('[DONE] ✔', argv.output);
+}
