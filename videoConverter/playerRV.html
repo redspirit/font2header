@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>RV Player</title>
+        <style>
+            body {
+                background: #000;
+                color: #0f0;
+                font-family: monospace;
+            }
+            canvas {
+                image-rendering: pixelated;
+                border: 1px solid #444;
+                display: block;
+                margin-top: 10px;
+            }
+        </style>
+    </head>
+    <body>
+        <h3>RV Player (v1)</h3>
+
+        <input type="file" id="file" accept=".rv" />
+        <div id="info"></div>
+        <canvas id="screen"></canvas>
+
+        <script>
+            const fileInput = document.getElementById('file');
+            const canvas = document.getElementById('screen');
+            const ctx = canvas.getContext('2d');
+            const info = document.getElementById('info');
+
+            let timer = null;
+
+            function u16(buf, off) {
+                return buf[off] | (buf[off + 1] << 8);
+            }
+
+            function u32(buf, off) {
+                return (
+                    (buf[off] |
+                        (buf[off + 1] << 8) |
+                        (buf[off + 2] << 16) |
+                        (buf[off + 3] << 24)) >>>
+                    0
+                );
+            }
+
+            fileInput.addEventListener('change', async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                if (timer) {
+                    clearInterval(timer);
+                    timer = null;
+                }
+
+                const buffer = await file.arrayBuffer();
+                const data = new Uint8Array(buffer);
+                let off = 0;
+
+                // -----------------------------------------------------------------
+                // Header (RV v1)
+                // -----------------------------------------------------------------
+
+                const magic = String.fromCharCode(data[0], data[1]);
+                if (magic !== 'RV') {
+                    alert('Not an RV file');
+                    return;
+                }
+
+                const version = data[2];
+                if (version !== 1) {
+                    alert(`Unsupported RV version ${version}`);
+                    return;
+                }
+
+                const width = u16(data, 3);
+                const height = u16(data, 5);
+                const fps = u16(data, 7);
+                const frames = u32(data, 9);
+                const bpp = data[13];
+
+                off = 14;
+
+                if (bpp !== 8) {
+                    alert('Only 8-bit RGB332 supported');
+                    return;
+                }
+
+                info.textContent =
+                    `${file.name} | RV v${version} | ` +
+                    `${width}x${height} | ${fps} fps | ` +
+                    `${frames} frames | RGB332`;
+
+                // -----------------------------------------------------------------
+                // Canvas / framebuffer
+                // -----------------------------------------------------------------
+
+                canvas.width = width;
+                canvas.height = height;
+
+                const img = ctx.createImageData(width, height);
+                const pixelsPerFrame = width * height;
+
+                let frameIndex = 0;
+
+                // -----------------------------------------------------------------
+                // Render one frame
+                // -----------------------------------------------------------------
+
+                function renderFrame(frameData) {
+                    for (let i = 0; i < pixelsPerFrame; i++) {
+                        const v = frameData[i];
+
+                        // EXACT same decode as ESP32 inverse
+                        const r = (v & 0b00000111) << 5;
+                        const g = (v & 0b00111000) << 2;
+                        const b = v & 0b11000000;
+
+                        const o = i * 4;
+                        img.data[o + 0] = r;
+                        img.data[o + 1] = g;
+                        img.data[o + 2] = b;
+                        img.data[o + 3] = 255;
+                    }
+                    ctx.putImageData(img, 0, 0);
+                }
+
+                // -----------------------------------------------------------------
+                // Playback loop
+                // -----------------------------------------------------------------
+
+                timer = setInterval(() => {
+                    if (frameIndex >= frames) {
+                        clearInterval(timer);
+                        return;
+                    }
+
+                    const frameData = data.subarray(off, off + pixelsPerFrame);
+                    off += pixelsPerFrame;
+
+                    renderFrame(frameData);
+                    frameIndex++;
+                }, 1000 / fps);
+            });
+        </script>
+    </body>
+</html>
